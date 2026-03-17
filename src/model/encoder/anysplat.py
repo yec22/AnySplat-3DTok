@@ -110,11 +110,12 @@ class EncoderAnySplatCfg:
     voxelize: bool = False
     use_scene_query: bool = False
     num_scene_queries: int = 8192
-    scene_query_hidden_dim: int = 128
+    scene_query_hidden_dim: int = 256
     scene_query_num_layers: int = 4
-    scene_query_head_dim: int = 64
+    scene_query_head_dim: int = 128
     num_fourier_frequencies: int = 6
     scene_token_latent_dim: int = 64
+    n_anchor_offset: int = 4
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -221,11 +222,11 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 hidden_dim=cfg.scene_query_hidden_dim,
                 raw_gs_dim=self.gaussian_adapter.d_in,
                 num_anchors=cfg.num_scene_queries,
-                voxel_size=cfg.voxel_size,
                 num_self_attn_layers=cfg.scene_query_num_layers,
                 head_dim=cfg.scene_query_head_dim,
                 fourier_freq=cfg.num_fourier_frequencies,
                 latent_dim=cfg.scene_token_latent_dim,
+                n_offsets=cfg.n_anchor_offset,
             )
 
     def map_pdf_to_opacity(
@@ -471,14 +472,14 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 patch_start_idx,
                 conf=pts_conf,
             )
-            # gs_params: (B, N, raw_gs_dim + 1),  anchor_pts: (B, N, 3)
-            # anchor_pts: (B, N, 3) world-space
-            # query_latent: (B, N, latent_dim) for downstream diffusion
+            # gs_params: (B, N*K, raw_gs_dim + 1), anchor_pts: (B, N*K, 3)  K = n_anchor_offset
+            # anchor_pts: (B, N*K, 3) world-space Gaussian positions (anchor center + offset)
+            # query_latent: (B, N, latent_dim) per-anchor latent for downstream diffusion
 
             del aggregated_tokens_list, patch_start_idx
             torch.cuda.empty_cache()
 
-            neural_pts = anchor_pts # world-space anchor positions
+            neural_pts = anchor_pts  # (B, N*K, 3) world-space Gaussian positions
 
             depths = anchor_pts[..., 2:3]
             densities = gs_params[..., 0].sigmoid()

@@ -10,4 +10,6 @@ torchrun \
   +experiment=multi-dataset \
   trainer.num_nodes=1 \
   model.encoder.use_scene_query=true \
-  model.encoder.num_scene_queries=8192
+  model.encoder.num_scene_queries=16384 \
+  model.encoder.scene_token_latent_dim=64 \
+  model.encoder.n_anchor_offset=4

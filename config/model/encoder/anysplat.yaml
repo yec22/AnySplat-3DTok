@@ -47,3 +47,6 @@ num_scene_queries: 8192
 scene_query_hidden_dim: 256
 scene_query_num_layers: 4
 scene_query_head_dim: 128
+num_fourier_frequencies: 6
+scene_token_latent_dim: 64
+n_anchor_offset: 4

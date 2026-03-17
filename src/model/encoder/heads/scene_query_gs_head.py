@@ -29,11 +29,11 @@ class SceneQueryGSHead(nn.Module):
         hidden_dim: int = 256,    # internal query / attention dim
         raw_gs_dim: int = 84,     # raw GS param dim from gaussian_adapter (excluding opacity)
         num_anchors: int = 8192,  # max number of scene anchors / Gaussians
-        voxel_size: float = 0.01,
         num_self_attn_layers: int = 4,
         head_dim: int = 64,
         fourier_freq: int = 6,    # number of frequency bands for positional encoding
         latent_dim: int = 64,
+        n_offsets: int = 4,       # number of Gaussians per anchor
     ):
         super().__init__()
         self.feat_extractor = feat_extractor
@@ -42,15 +42,15 @@ class SceneQueryGSHead(nn.Module):
         self.latent_dim = latent_dim
         self.raw_gs_dim = raw_gs_dim
         self.num_anchors = num_anchors
-        self.voxel_size = voxel_size
         self.fourier_freq = fourier_freq
+        self.n_offsets = n_offsets
 
         # Fourier encoding: 3 (xyz) + 6*3*2 (sin/cos for each freq) = 39 dims
         self.fourier_dim = 3 + fourier_freq * 3 * 2
 
         # 3D position encoder: maps (x,y,z) → hidden_dim query vector
         self.pos_encoder = nn.Sequential(
-            nn.Linear(3, hidden_dim),
+            nn.Linear(self.fourier_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
@@ -67,7 +67,7 @@ class SceneQueryGSHead(nn.Module):
 
         # Self-attention refinement among anchors
         self.self_attn_blocks = nn.ModuleList([
-            TransformerBlockSelfAttn(hidden_dim, head_dim)
+            TransformerBlockSelfAttn(hidden_dim * 2, head_dim)
             for _ in range(num_self_attn_layers)
         ])
 
@@ -76,22 +76,33 @@ class SceneQueryGSHead(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, latent_dim)
+            nn.Linear(hidden_dim, latent_dim)
         )
         self.layer_norm = nn.LayerNorm(latent_dim)
 
-        # Output MLP: hidden_dim → raw_gs_dim + 1 (opacity logit + GS params)
-        self.output_mlp = nn.Linear(hidden_dim, raw_gs_dim + 1)
+        # Output MLP: [query_latent, slot_token] → GS params
+        # Input: (B, N, K, latent_dim * 2), Output: (B, N, K, raw_gs_dim + 1)
+        self.output_mlp = nn.Sequential(
+            nn.Linear(latent_dim * 2, latent_dim * 2),
+            nn.GELU(),
+            nn.Linear(latent_dim * 2, raw_gs_dim + 1),
+        )
+
+        # Predict per-slot 3D offset; takes slot-conditioned feature → 3
+        self.offset_mlp = nn.Sequential(
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.GELU(),
+            nn.Linear(latent_dim, 3),
+        )
+
+        # K learnable slot tokens to diversify K Gaussian decodings (prevent collapse)
+        self.slot_tokens = nn.Parameter(torch.randn(n_offsets, latent_dim))
 
         self.apply(_init_weights)
 
     # ------------------------------------------------------------------
     # Public forward
     # ------------------------------------------------------------------
-
     def forward(
         self,
         aggregated_tokens_list: List[torch.Tensor],
@@ -104,8 +115,9 @@ class SceneQueryGSHead(nn.Module):
     ):
         """
         Returns:
-            gs_params:   (B, N, raw_gs_dim + 1)  — first channel is opacity logit
-            anchor_pts:  (B, N, 3)               — world-space anchor positions
+            gs_params:   (B, N*K, raw_gs_dim + 1)  — first channel is opacity logit
+            anchor_pts:  (B, N*K, 3)               — world-space Gaussian positions (anchor + offset)
+            query_latent: (B, N, latent_dim)        — per-anchor latent for downstream diffusion
         """
         B, V, _, H, W = imgs.shape
 
@@ -116,17 +128,29 @@ class SceneQueryGSHead(nn.Module):
         feat_2d = feat_2d.float()
 
         # 2. Voxelize pts_all → anchor_pts
-        anchor_pts = self.voxelize_anchors(pts_all, None, None, self.num_anchors)
-        # (B, N, 3)
-        N = anchor_pts.shape[1]
+        anchor_pts, valid_counts, voxel_sizes = self.voxelize_anchors(pts_all, None, self.num_anchors)
+        # anchor_pts: (B, N, 3),  valid_counts: (B,),  voxel_sizes: (B,)
+        B_cur, N, _ = anchor_pts.shape
 
-        # Normalize anchor_pts to canonical space [-1, 1]
-        scene_center = anchor_pts.mean(dim=1, keepdim=True) # (B, 1, 3)
-        # Use Euclidean distance (scene radius) with quantile to be robust to outliers
-        dists = (anchor_pts - scene_center).norm(dim=-1) # (B, N)
-        scene_scale = torch.quantile(dists, 0.95, dim=1, keepdim=True) # (B, 1)
-        scene_scale = scene_scale.clamp(min=1e-8) # avoid division by zero
-        anchor_pts_normalized = (anchor_pts - scene_center) / scene_scale.unsqueeze(-1) # (B, N, 3), mostly in [-1, 1]
+        # Build a boolean mask for valid (non-padded) anchors
+        idx = torch.arange(N, device=anchor_pts.device).unsqueeze(0)  # (1, N)
+        valid_mask_anchor = idx < valid_counts.unsqueeze(1)             # (B, N)
+
+        # Normalize anchor_pts to canonical space [-1, 1] — use only valid anchors
+        valid_counts_f = valid_counts.float().clamp(min=1).view(B_cur, 1, 1)
+        masked_pts = anchor_pts * valid_mask_anchor.unsqueeze(-1).float()
+        scene_center = masked_pts.sum(dim=1, keepdim=True) / valid_counts_f  # (B, 1, 3)
+
+        dists = (anchor_pts - scene_center).norm(dim=-1)  # (B, N)
+        # Quantile over valid anchors only (loop per sample to avoid padding interference)
+        scene_scale_list = []
+        for i in range(B_cur):
+            valid_dists = dists[i, valid_mask_anchor[i]]
+            q = torch.quantile(valid_dists, 0.95) if valid_dists.numel() > 0 else dists.new_tensor(1.0)
+            scene_scale_list.append(q)
+        scene_scale = torch.stack(scene_scale_list).view(B_cur, 1).clamp(min=1e-8)  # (B, 1)
+
+        anchor_pts_normalized = (anchor_pts - scene_center) / scene_scale.unsqueeze(-1)  # (B, N, 3)
 
         # 3. Query initialization from normalized 3D positions (with Fourier encoding)
         anchor_pts_encoded = self.fourier_encode(anchor_pts_normalized)
@@ -153,6 +177,10 @@ class SceneQueryGSHead(nn.Module):
         # 6. Combine query and aggregated features
         query = torch.cat([query, agg_feat], dim=-1)  # (B, N, hidden_dim * 2)
 
+        # Zero out padded anchors before self-attention to prevent them from
+        # corrupting valid anchor representations as spurious keys
+        query = query * valid_mask_anchor.unsqueeze(-1).float()
+
         # 7. Self-attention refinement
         for block in self.self_attn_blocks:
             query = torch.utils.checkpoint.checkpoint(block, query, use_reentrant=False)
@@ -162,10 +190,35 @@ class SceneQueryGSHead(nn.Module):
         query_latent = self.layer_norm(query_latent) # (B, N, D)
         # !!! query_latent for diffusion generation
 
-        # 9. Output GS params
-        gs_params = self.output_mlp(query_latent)  # (B, N, raw_gs_dim + 1)
+        # 9. Build slot-conditioned features, then predict K offsets and K GS params
+        K = self.n_offsets
 
-        return gs_params, anchor_pts, query_latent
+        # Concat query_latent with each slot token → shared slot-conditioned representation
+        query_exp = query_latent.unsqueeze(2).expand(-1, -1, K, -1)          # (B, N, K, latent_dim)
+        slot_exp = self.slot_tokens[None, None].expand(B_cur, N, -1, -1)     # (B, N, K, latent_dim)
+        slot_feat = torch.cat([query_exp, slot_exp], dim=-1)                 # (B, N, K, latent_dim*2)
+
+        # Predict K 3D offsets; tanh constrains each offset within the adaptive voxel radius
+        # voxel_sizes: (B,) → (B, 1, 1, 1) for broadcasting over (B, N, K, 3)
+        offset_scale = voxel_sizes.view(B_cur, 1, 1, 1)
+        offsets = torch.tanh(self.offset_mlp(slot_feat)) * offset_scale      # (B, N, K, 3)
+
+        # Predict K sets of GS params
+        gs_params = self.output_mlp(slot_feat)                               # (B, N, K, raw_gs_dim+1)
+
+        # Compute K Gaussian world positions
+        gs_positions = anchor_pts.unsqueeze(2) + offsets                     # (B, N, K, 3)
+
+        # Flatten to (B, N*K, ...)
+        gs_positions_flat = gs_positions.reshape(B_cur, N * K, 3)
+        gs_params_flat = gs_params.reshape(B_cur, N * K, self.raw_gs_dim + 1)
+
+        # Set opacity logit of padded anchor's K Gaussians to -20 (sigmoid ≈ 0)
+        valid_mask_flat = valid_mask_anchor.unsqueeze(2).expand(-1, -1, K).reshape(B_cur, N * K)
+        gs_params_flat = gs_params_flat.clone()
+        gs_params_flat[~valid_mask_flat, 0] = -20.0
+
+        return gs_params_flat, gs_positions_flat, query_latent
 
     # ------------------------------------------------------------------
     # Helpers
@@ -179,7 +232,6 @@ class SceneQueryGSHead(nn.Module):
             (B, N, fourier_dim) encoded features
             fourier_dim = 3 + fourier_freq * 3 * 2 (e.g., 3 + 10 * 3 * 2 = 63)
         """
-        B, N, _ = x.shape
         device = x.device
         dtype = x.dtype
 
@@ -196,22 +248,27 @@ class SceneQueryGSHead(nn.Module):
         self,
         pts_all: torch.Tensor,          # (B, V, H, W, 3)
         conf: Optional[torch.Tensor],   # (B, V, H, W) or None
-        voxel_size: Optional[float],    # Optional voxel size override
         max_n: int,
-    ) -> torch.Tensor:
+    ):
+        """
+        Returns:
+            anchor_pts:   (B, max_voxels, 3)  — padded with 0 for invalid entries
+            valid_counts: (B,)  — number of valid anchors per sample
+            voxel_sizes:  (B,)  — adaptive voxel size per sample (for offset radius scaling)
+        """
         B = pts_all.shape[0]
         results = []
-        
+        used_voxel_sizes = []
+
         for b in range(B):
             pts = pts_all[b].reshape(-1, 3).float()   # (N_points, 3)
             c = conf[b].reshape(-1).float() if conf is not None else None
             # binary search to find the optimal voxel size
-            curr_voxel_size = voxel_size
-            if curr_voxel_size is None:
-                curr_voxel_size = self._estimate_adaptive_voxel_size(pts, max_n)
+            curr_voxel_size = self._estimate_adaptive_voxel_size(pts, max_n)
+            used_voxel_sizes.append(curr_voxel_size)
 
             vox_idx = (pts / curr_voxel_size).round().long()
-            unique_vox, inv = torch.unique(vox_idx, dim=0, return_inverse=True)
+            _, inv = torch.unique(vox_idx, dim=0, return_inverse=True)
             if c is not None:
                 c_pos = c.clamp(min=0)
                 vox_sum_c = scatter_add(c_pos, inv, dim=0)
@@ -228,16 +285,26 @@ class SceneQueryGSHead(nn.Module):
                     top_idx = torch.randperm(vox_pts.shape[0], device=pts.device)[:max_n]
                 vox_pts = vox_pts[top_idx]
             results.append(vox_pts)
-        
-        max_voxels = max(r.shape[0] for r in results)
-        return self.pad_tensor_list(results, (max_voxels,), value=-1e4)
+
+        valid_counts = torch.tensor(
+            [r.shape[0] for r in results], device=pts_all.device, dtype=torch.long
+        )
+        voxel_sizes = torch.tensor(
+            used_voxel_sizes, device=pts_all.device, dtype=torch.float32
+        )  # (B,)
+        max_voxels = int(valid_counts.max().item())
+        # Pad with 0 (neutral value) instead of -1e4, valid_counts tracks real boundaries
+        anchor_pts = self.pad_tensor_list(results, (max_voxels,), value=0.0)
+        return anchor_pts, valid_counts, voxel_sizes
         
     def _estimate_adaptive_voxel_size(self, pts: torch.Tensor, max_n: int, iterations: int = 10) -> float:
         """
         Binary search to find the optimal voxel size that results in max_n anchors.
         """
-        pt_min = pts.min(dim=0).values
-        pt_max = pts.max(dim=0).values
+        # Use 5th/95th percentile to exclude outlier points (sky, far background)
+        # that would otherwise inflate diag and degrade binary search convergence
+        pt_min = torch.quantile(pts, 0.05, dim=0)
+        pt_max = torch.quantile(pts, 0.95, dim=0)
         diag = torch.norm(pt_max - pt_min).item()
         
         low = 0.0001
