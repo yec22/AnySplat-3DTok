@@ -1,0 +1,10 @@
+{
+  "ty.inlayHints.variableTypes": false,
+  "ty.inlayHints.callArgumentNames": false,
+  "ty.completions.autoImport": false,
+  "terminal.fontSize": 18,
+  "editor.fontSize": 18,
+  "ai.model": "Kimi-K2.5",
+  "ai.apiKey": "uC57cosVx4E7Vb2sfWmkyK3J4Wogd9Cd",
+  "editor.suggest.maxVisibleSuggestions": 12
+}
