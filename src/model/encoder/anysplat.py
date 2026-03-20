@@ -109,7 +109,9 @@ class EncoderAnySplatCfg:
     intermediate_layer_idx: Optional[List[int]] = None
     voxelize: bool = False
     use_scene_query: bool = False
-    num_scene_queries: int = 8192
+    num_scene_queries: int = 32768
+    num_coarse_anchors: int = 8192
+    num_cross_attn_layers: int = 2
     scene_query_hidden_dim: int = 256
     scene_query_num_layers: int = 4
     scene_query_head_dim: int = 128
@@ -222,7 +224,9 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 hidden_dim=cfg.scene_query_hidden_dim,
                 raw_gs_dim=self.gaussian_adapter.d_in,
                 num_anchors=cfg.num_scene_queries,
+                num_coarse_anchors=cfg.num_coarse_anchors,
                 num_self_attn_layers=cfg.scene_query_num_layers,
+                num_cross_attn_layers=cfg.num_cross_attn_layers,
                 head_dim=cfg.scene_query_head_dim,
                 fourier_freq=cfg.num_fourier_frequencies,
                 latent_dim=cfg.scene_token_latent_dim,

@@ -35,15 +35,17 @@ scale_align: false
 
 voxel_size: 0.001
 n_offsets: 2
-anchor_feat_dim: 83 # 32
+anchor_feat_dim: 83
 add_view: false
 color_attr: 3D # 3D or RGB
 mlp_type: unified
 scaffold: true
 
-# Scene Query GS Head (anchor-based, decoupled from view count)
+# Scene Query GS Head — hierarchical two-level anchor structure
 use_scene_query: false
-num_scene_queries: 8192
+num_scene_queries: 32768       # total anchors = coarse + fine
+num_coarse_anchors: 8192       # uniform global coverage
+num_cross_attn_layers: 2       # fine-to-coarse cross-attention layers
 scene_query_hidden_dim: 256
 scene_query_num_layers: 4
 scene_query_head_dim: 128

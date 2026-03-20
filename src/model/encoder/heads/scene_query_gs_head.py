@@ -5,35 +5,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_add
-from .head_modules import TransformerBlockSelfAttn, _init_weights
+from .head_modules import TransformerBlockSelfAttn, TransformerBlockCrossAttn, _init_weights
 
 
 class SceneQueryGSHead(nn.Module):
     """
-    Anchor-based Gaussian prediction head.
+    Hierarchical two-level anchor-based Gaussian prediction head.
 
     Pipeline:
-      1. Extract per-pixel 2D features via feat_extractor.forward_features()
-      2. Voxelize pts_all into N anchor points (confidence-guided, O(N))
-      3. Initialize per-anchor queries from 3D positions
-      4. Project anchors into each view, sample 2D features at projected locations
-      5. Aggregate multi-view features with soft attention (masked for visibility)
-      6. Combine query + aggregated features
-      7. Refine with self-attention among anchors
-      8. Output GS params per anchor
+      Coarse level (N0 anchors): uniform voxelization → global scene coverage
+      Fine level   (N1 anchors): confidence-guided voxelization → complex regions
+      Cross-attention fine→coarse injects global context into fine queries
+      Joint self-attention refinement over all N0+N1 anchors
+      Slot tokens decode K Gaussians per anchor
     """
     def __init__(
         self,
-        feat_extractor,           # VGGT_DPT_GS_Head instance; provides forward_features()
-        feat_dim: int = 128,      # DPT intermediate feature dim (head_features_1)
-        hidden_dim: int = 256,    # internal query / attention dim
-        raw_gs_dim: int = 84,     # raw GS param dim from gaussian_adapter (excluding opacity)
-        num_anchors: int = 8192,  # max number of scene anchors / Gaussians
-        num_self_attn_layers: int = 4,
+        feat_extractor,              # VGGT_DPT_GS_Head; provides forward_features()
+        feat_dim: int = 128,         # DPT intermediate feature dim
+        hidden_dim: int = 256,       # internal query / attention dim
+        raw_gs_dim: int = 84,        # raw GS param dim from gaussian_adapter (excl. opacity)
+        num_anchors: int = 32768,    # total anchors = coarse + fine
+        num_coarse_anchors: int = 8192,  # coarse anchors (uniform global coverage)
+        num_self_attn_layers: int = 4,   # joint self-attn layers after concat
+        num_cross_attn_layers: int = 2,  # fine→coarse cross-attn layers
         head_dim: int = 64,
-        fourier_freq: int = 6,    # number of frequency bands for positional encoding
+        fourier_freq: int = 6,
         latent_dim: int = 64,
-        n_offsets: int = 4,       # number of Gaussians per anchor
+        n_offsets: int = 4,          # Gaussians per anchor
     ):
         super().__init__()
         self.feat_extractor = feat_extractor
@@ -41,14 +40,20 @@ class SceneQueryGSHead(nn.Module):
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.raw_gs_dim = raw_gs_dim
+        assert num_coarse_anchors < num_anchors, (
+            f"num_coarse_anchors ({num_coarse_anchors}) must be < num_anchors ({num_anchors}), "
+            f"otherwise num_fine=0 and the fine branch collapses"
+        )
         self.num_anchors = num_anchors
+        self.num_coarse = num_coarse_anchors
+        self.num_fine = num_anchors - num_coarse_anchors
         self.fourier_freq = fourier_freq
         self.n_offsets = n_offsets
 
-        # Fourier encoding: 3 (xyz) + 6*3*2 (sin/cos for each freq) = 39 dims
+        # Fourier encoding: 3 (xyz) + fourier_freq*3*2 (sin/cos per freq)
         self.fourier_dim = 3 + fourier_freq * 3 * 2
 
-        # 3D position encoder: maps (x,y,z) → hidden_dim query vector
+        # 3D position encoder: Fourier → hidden_dim query vector
         self.pos_encoder = nn.Sequential(
             nn.Linear(self.fourier_dim, hidden_dim),
             nn.GELU(),
@@ -58,20 +63,32 @@ class SceneQueryGSHead(nn.Module):
         # Project sampled 2D features to hidden_dim
         self.feat_proj = nn.Linear(feat_dim, hidden_dim)
 
-        # Per-view attention logit: (hidden_dim) → 1
+        # Per-view attention logit: hidden_dim → 1
         self.view_agg_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        # Self-attention refinement among anchors
+        # Coarse branch: 2 self-attention layers before cross-attn
+        self.coarse_self_attn_blocks = nn.ModuleList([
+            TransformerBlockSelfAttn(hidden_dim * 2, head_dim)
+            for _ in range(2)
+        ])
+
+        # Cross-attention: fine queries attend to coarse key/values
+        self.cross_attn_blocks = nn.ModuleList([
+            TransformerBlockCrossAttn(hidden_dim * 2, head_dim)
+            for _ in range(num_cross_attn_layers)
+        ])
+
+        # Joint self-attention refinement over all anchors
         self.self_attn_blocks = nn.ModuleList([
             TransformerBlockSelfAttn(hidden_dim * 2, head_dim)
             for _ in range(num_self_attn_layers)
         ])
 
-        # For downstream diffusion
+        # Latent projection for downstream diffusion
         self.latent_proj = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -81,21 +98,20 @@ class SceneQueryGSHead(nn.Module):
         self.layer_norm = nn.LayerNorm(latent_dim)
 
         # Output MLP: [query_latent, slot_token] → GS params
-        # Input: (B, N, K, latent_dim * 2), Output: (B, N, K, raw_gs_dim + 1)
         self.output_mlp = nn.Sequential(
             nn.Linear(latent_dim * 2, latent_dim * 2),
             nn.GELU(),
             nn.Linear(latent_dim * 2, raw_gs_dim + 1),
         )
 
-        # Predict per-slot 3D offset; takes slot-conditioned feature → 3
+        # Offset MLP: slot-conditioned feature → 3D offset
         self.offset_mlp = nn.Sequential(
             nn.Linear(latent_dim * 2, latent_dim),
             nn.GELU(),
             nn.Linear(latent_dim, 3),
         )
 
-        # K learnable slot tokens to diversify K Gaussian decodings (prevent collapse)
+        # K learnable slot tokens to diversify K Gaussian decodings
         self.slot_tokens = nn.Parameter(torch.randn(n_offsets, latent_dim))
 
         self.apply(_init_weights)
@@ -109,15 +125,15 @@ class SceneQueryGSHead(nn.Module):
         pts_all: torch.Tensor,          # (B, V, H, W, 3)  world-space points
         imgs: torch.Tensor,             # (B, V, 3, H, W)
         extrinsic: torch.Tensor,        # (B, V, 3, 4)  w2c
-        intrinsic: torch.Tensor,        # (B, V, 3, 3)  pixel-space [fx,0,cx; 0,fy,cy; 0,0,1]
+        intrinsic: torch.Tensor,        # (B, V, 3, 3)  pixel-space
         patch_start_idx: int,
         conf: Optional[torch.Tensor] = None,  # (B, V, H, W) confidence
     ):
         """
         Returns:
-            gs_params:   (B, N*K, raw_gs_dim + 1)  — first channel is opacity logit
-            anchor_pts:  (B, N*K, 3)               — world-space Gaussian positions (anchor + offset)
-            query_latent: (B, N, latent_dim)        — per-anchor latent for downstream diffusion
+            gs_params:    (B, (N0+N1)*K, raw_gs_dim + 1)  — first channel is opacity logit
+            gs_positions: (B, (N0+N1)*K, 3)               — world-space Gaussian positions
+            query_latent: (B, N0+N1, latent_dim)           — per-anchor latent for downstream
         """
         B, V, _, H, W = imgs.shape
 
@@ -127,121 +143,181 @@ class SceneQueryGSHead(nn.Module):
         )  # (B, V, feat_dim, H, W)
         feat_2d = feat_2d.float()
 
-        # 2. Voxelize pts_all → anchor_pts
-        anchor_pts, valid_counts, voxel_sizes = self.voxelize_anchors(pts_all, None, self.num_anchors)
-        # anchor_pts: (B, N, 3),  valid_counts: (B,),  voxel_sizes: (B,)
-        B_cur, N, _ = anchor_pts.shape
+        # 2. Coarse voxelization first — its valid anchors serve as scene stat representatives.
+        #    Using voxelized coarse anchors (not raw pts_all) avoids center/scale being
+        #    inflated by sky/background pixels, which would compress the Fourier encoding
+        #    resolution for the actual scene of interest.
+        coarse_pts, coarse_valid, coarse_voxel_sizes = self.voxelize_anchors(
+            pts_all, conf=None, max_n=self.num_coarse
+        )  # (B, num_coarse, 3), (B,), (B,)
 
-        # Build a boolean mask for valid (non-padded) anchors
-        idx = torch.arange(N, device=anchor_pts.device).unsqueeze(0)  # (1, N)
-        valid_mask_anchor = idx < valid_counts.unsqueeze(1)             # (B, N)
+        coarse_mask = (
+            torch.arange(self.num_coarse, device=coarse_pts.device).unsqueeze(0)
+            < coarse_valid.unsqueeze(1)
+        )  # (B, num_coarse)
 
-        # Normalize anchor_pts to canonical space [-1, 1] — use only valid anchors
-        valid_counts_f = valid_counts.float().clamp(min=1).view(B_cur, 1, 1)
-        masked_pts = anchor_pts * valid_mask_anchor.unsqueeze(-1).float()
-        scene_center = masked_pts.sum(dim=1, keepdim=True) / valid_counts_f  # (B, 1, 3)
+        # 3. Shared scene normalization — computed from valid coarse anchors only.
+        #    Both coarse and fine branches share the same coordinate system.
+        valid_counts_f = coarse_valid.float().clamp(min=1).view(B, 1, 1)
+        masked_coarse = coarse_pts * coarse_mask.unsqueeze(-1).float()
+        scene_center = masked_coarse.sum(dim=1, keepdim=True) / valid_counts_f  # (B, 1, 3)
 
-        dists = (anchor_pts - scene_center).norm(dim=-1)  # (B, N)
-        # Quantile over valid anchors only (loop per sample to avoid padding interference)
+        dists = (coarse_pts - scene_center).norm(dim=-1)  # (B, num_coarse)
         scene_scale_list = []
-        for i in range(B_cur):
-            valid_dists = dists[i, valid_mask_anchor[i]]
-            q = torch.quantile(valid_dists, 0.95) if valid_dists.numel() > 0 else dists.new_tensor(1.0)
+        for i in range(B):
+            valid_dists = dists[i, coarse_mask[i]]
+            q = torch.quantile(valid_dists, 0.99) if valid_dists.numel() > 0 else dists.new_tensor(1.0)
             scene_scale_list.append(q)
-        scene_scale = torch.stack(scene_scale_list).view(B_cur, 1).clamp(min=1e-8)  # (B, 1)
+        scene_scale = torch.stack(scene_scale_list).view(B, 1).clamp(min=1e-8)  # (B, 1)
 
-        anchor_pts_normalized = (anchor_pts - scene_center) / scene_scale.unsqueeze(-1)  # (B, N, 3)
+        # 4. Fine voxelization — confidence-guided, focuses on high-complexity regions
+        #    Uses the same pts_all; conf selects denser anchors in uncertain/detailed areas.
+        fine_pts, fine_valid, fine_voxel_sizes = self.voxelize_anchors(
+            pts_all, conf=conf, max_n=self.num_fine
+        )  # (B, num_fine, 3), (B,), (B,)
 
-        # 3. Query initialization from normalized 3D positions (with Fourier encoding)
+        fine_mask = (
+            torch.arange(self.num_fine, device=fine_pts.device).unsqueeze(0)
+            < fine_valid.unsqueeze(1)
+        )  # (B, num_fine)
+
+        # 5. Process coarse branch: pos_encode + 2D feat sampling + view aggregation
+        coarse_query = self._process_branch(
+            coarse_pts, coarse_mask, feat_2d, extrinsic, intrinsic,
+            scene_center, scene_scale, H, W
+        )  # (B, num_coarse, hidden_dim * 2)
+
+        # 2 coarse self-attention layers (with gradient checkpointing)
+        for block in self.coarse_self_attn_blocks:
+            coarse_query = torch.utils.checkpoint.checkpoint(
+                block, coarse_query, use_reentrant=False
+            )
+
+        # 6. Process fine branch
+        fine_query = self._process_branch(
+            fine_pts, fine_mask, feat_2d, extrinsic, intrinsic,
+            scene_center, scene_scale, H, W
+        )  # (B, num_fine, hidden_dim * 2)
+
+        # 7. Cross-attention: fine queries attend to coarse (direct call — no checkpoint,
+        #    since TransformerBlockCrossAttn.forward takes a list argument)
+        for block in self.cross_attn_blocks:
+            fine_query = block([fine_query, coarse_query])
+
+        # 8. Concatenate coarse + fine and apply joint self-attention
+        full_query = torch.cat([coarse_query, fine_query], dim=1)  # (B, N, hidden_dim*2)
+        for block in self.self_attn_blocks:
+            full_query = torch.utils.checkpoint.checkpoint(
+                block, full_query, use_reentrant=False
+            )
+
+        # 9. Latent projection
+        query_latent = self.latent_proj(full_query)
+        query_latent = self.layer_norm(query_latent)  # (B, N, latent_dim)
+
+        # 10. Slot tokens → K offsets and K GS params per anchor
+        K = self.n_offsets
+        N = self.num_anchors
+        query_exp = query_latent.unsqueeze(2).expand(-1, -1, K, -1)     # (B, N, K, latent_dim)
+        slot_exp = self.slot_tokens[None, None].expand(B, N, -1, -1)    # (B, N, K, latent_dim)
+        slot_feat = torch.cat([query_exp, slot_exp], dim=-1)            # (B, N, K, latent_dim*2)
+
+        # Per-anchor offset scale: coarse anchors use coarse voxel size, fine use fine
+        anchor_voxel_sizes = torch.cat([
+            coarse_voxel_sizes.unsqueeze(1).expand(-1, self.num_coarse),
+            fine_voxel_sizes.unsqueeze(1).expand(-1, self.num_fine),
+        ], dim=1)  # (B, N)
+        offset_scale = anchor_voxel_sizes.unsqueeze(-1).unsqueeze(-1)   # (B, N, 1, 1)
+
+        offsets = torch.tanh(self.offset_mlp(slot_feat)) * offset_scale  # (B, N, K, 3)
+        gs_params = self.output_mlp(slot_feat)                           # (B, N, K, raw_gs_dim+1)
+
+        # 11. Compute GS world-space positions
+        all_anchor_pts = torch.cat([coarse_pts, fine_pts], dim=1)        # (B, N, 3)
+        gs_positions = all_anchor_pts.unsqueeze(2) + offsets             # (B, N, K, 3)
+
+        # 12. Flatten to (B, N*K, ...)
+        gs_params_flat = gs_params.reshape(B, N * K, self.raw_gs_dim + 1)
+        gs_positions_flat = gs_positions.reshape(B, N * K, 3)
+
+        # 13. Mask padded anchors (opacity → -20 ≈ 0) and scale Gaussian scales by scene_scale
+        all_valid_mask = torch.cat([coarse_mask, fine_mask], dim=1)      # (B, N)
+        valid_mask_flat = all_valid_mask.unsqueeze(2).expand(-1, -1, K).reshape(B, -1)
+        gs_params_flat = gs_params_flat.clone()
+        gs_params_flat[..., 0][~valid_mask_flat] = -20.0
+        gs_params_flat[..., 1:4] = gs_params_flat[..., 1:4] + torch.log(scene_scale).unsqueeze(1)
+
+        return gs_params_flat, gs_positions_flat, query_latent
+
+    # ------------------------------------------------------------------
+    # Branch helper
+    # ------------------------------------------------------------------
+    def _process_branch(
+        self,
+        anchor_pts: torch.Tensor,    # (B, N, 3)  padded with 0 for invalid entries
+        valid_mask: torch.Tensor,    # (B, N)     bool
+        feat_2d: torch.Tensor,       # (B, V, feat_dim, H, W)
+        extrinsic: torch.Tensor,     # (B, V, 3, 4)
+        intrinsic: torch.Tensor,     # (B, V, 3, 3)
+        scene_center: torch.Tensor,  # (B, 1, 3)
+        scene_scale: torch.Tensor,   # (B, 1)
+        H: int,
+        W: int,
+    ) -> torch.Tensor:
+        """
+        Encode one level of anchors into (B, N, hidden_dim * 2) query vectors.
+        Steps: normalize → Fourier encode → pos_encoder → project+sample → view agg → cat
+        """
+        # Normalize to canonical space using shared scene stats
+        # scene_scale: (B, 1) → (B, 1, 1) for broadcasting over N, 3
+        anchor_pts_normalized = (anchor_pts - scene_center) / scene_scale.unsqueeze(-1)
+
+        # Fourier positional encoding + MLP
         anchor_pts_encoded = self.fourier_encode(anchor_pts_normalized)
         query = self.pos_encoder(anchor_pts_encoded)  # (B, N, hidden_dim)
 
-        # 4. Project anchors into views and sample 2D features
+        # Project anchors into each view and sample 2D features
         sampled, vis_mask = self._project_and_sample(
             anchor_pts, feat_2d, extrinsic, intrinsic, H, W
         )
         # sampled:  (B, N, V, feat_dim)
         # vis_mask: (B, N, V)  bool
 
-        # 5. View aggregation with masked soft attention
+        # View aggregation with masked soft attention
         proj_feat = self.feat_proj(sampled)  # (B, N, V, hidden_dim)
-        # Add query broadcast over views
         logits = self.view_agg_mlp(
             proj_feat + query.unsqueeze(2)
         ).squeeze(-1)  # (B, N, V)
-        # Mask out invisible views with large negative
         logits = logits + (~vis_mask).float() * -1e9
-        weights = torch.softmax(logits, dim=-1)  # (B, N, V)
+        weights = torch.softmax(logits, dim=-1)          # (B, N, V)
         agg_feat = (weights.unsqueeze(-1) * proj_feat).sum(dim=2)  # (B, N, hidden_dim)
 
-        # 6. Combine query and aggregated features
-        query = torch.cat([query, agg_feat], dim=-1)  # (B, N, hidden_dim * 2)
+        # Combine query + aggregated 2D features
+        query = torch.cat([query, agg_feat], dim=-1)     # (B, N, hidden_dim * 2)
 
-        # Zero out padded anchors before self-attention to prevent them from
-        # corrupting valid anchor representations as spurious keys
-        query = query * valid_mask_anchor.unsqueeze(-1).float()
-
-        # 7. Self-attention refinement
-        for block in self.self_attn_blocks:
-            query = torch.utils.checkpoint.checkpoint(block, query, use_reentrant=False)
-
-        # 8. for downstream diffusion
-        query_latent = self.latent_proj(query)
-        query_latent = self.layer_norm(query_latent) # (B, N, D)
-        # !!! query_latent for diffusion generation
-
-        # 9. Build slot-conditioned features, then predict K offsets and K GS params
-        K = self.n_offsets
-
-        # Concat query_latent with each slot token → shared slot-conditioned representation
-        query_exp = query_latent.unsqueeze(2).expand(-1, -1, K, -1)          # (B, N, K, latent_dim)
-        slot_exp = self.slot_tokens[None, None].expand(B_cur, N, -1, -1)     # (B, N, K, latent_dim)
-        slot_feat = torch.cat([query_exp, slot_exp], dim=-1)                 # (B, N, K, latent_dim*2)
-
-        # Predict K 3D offsets; tanh constrains each offset within the adaptive voxel radius
-        # voxel_sizes: (B,) → (B, 1, 1, 1) for broadcasting over (B, N, K, 3)
-        offset_scale = voxel_sizes.view(B_cur, 1, 1, 1)
-        offsets = torch.tanh(self.offset_mlp(slot_feat)) * offset_scale      # (B, N, K, 3)
-
-        # Predict K sets of GS params
-        gs_params = self.output_mlp(slot_feat)                               # (B, N, K, raw_gs_dim+1)
-
-        # Compute K Gaussian world positions
-        gs_positions = anchor_pts.unsqueeze(2) + offsets                     # (B, N, K, 3)
-
-        # Flatten to (B, N*K, ...)
-        gs_positions_flat = gs_positions.reshape(B_cur, N * K, 3)
-        gs_params_flat = gs_params.reshape(B_cur, N * K, self.raw_gs_dim + 1)
-
-        # Set opacity logit of padded anchor's K Gaussians to -20 (sigmoid ≈ 0)
-        valid_mask_flat = valid_mask_anchor.unsqueeze(2).expand(-1, -1, K).reshape(B_cur, N * K)
-        gs_params_flat = gs_params_flat.clone()
-        gs_params_flat[~valid_mask_flat, 0] = -20.0
-
-        return gs_params_flat, gs_positions_flat, query_latent
+        # Zero out padded anchors to prevent them from acting as spurious keys
+        query = query * valid_mask.unsqueeze(-1).float()
+        return query
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def fourier_encode(self, x: torch.Tensor) -> torch.Tensor:
         """
-        NeRF-style Fourier positional encoding optimized for [-1, 1] space.
+        NeRF-style Fourier positional encoding for [-1, 1] space.
         Args:
-            x: (B, N, 3) input 3D coordinates normalized to [-1, 1]
+            x: (B, N, 3) normalized 3D coordinates
         Returns:
-            (B, N, fourier_dim) encoded features
-            fourier_dim = 3 + fourier_freq * 3 * 2 (e.g., 3 + 10 * 3 * 2 = 63)
+            (B, N, fourier_dim)  where fourier_dim = 3 + fourier_freq * 3 * 2
         """
         device = x.device
         dtype = x.dtype
-
-        freq_bands = 2.0 ** torch.linspace(0, self.fourier_freq - 1, self.fourier_freq, device=device, dtype=dtype)
-
+        freq_bands = 2.0 ** torch.linspace(
+            0, self.fourier_freq - 1, self.fourier_freq, device=device, dtype=dtype
+        )
         x_in = x.unsqueeze(-1) * (freq_bands * math.pi)
-
         sin_enc = torch.sin(x_in).flatten(2)
         cos_enc = torch.cos(x_in).flatten(2)
-
         return torch.cat([x, sin_enc, cos_enc], dim=-1)
 
     def voxelize_anchors(
@@ -251,24 +327,29 @@ class SceneQueryGSHead(nn.Module):
         max_n: int,
     ):
         """
+        Voxelize pts_all into at most max_n anchor points per batch element.
+        Always pads output to exactly max_n (zero-padded), so shapes are deterministic
+        and suitable for direct concatenation of coarse and fine branches.
+
         Returns:
-            anchor_pts:   (B, max_voxels, 3)  — padded with 0 for invalid entries
-            valid_counts: (B,)  — number of valid anchors per sample
-            voxel_sizes:  (B,)  — adaptive voxel size per sample (for offset radius scaling)
+            anchor_pts:   (B, max_n, 3)  — zero-padded for invalid entries
+            valid_counts: (B,)           — actual number of valid anchors per sample
+            voxel_sizes:  (B,)           — adaptive voxel size per sample
         """
         B = pts_all.shape[0]
         results = []
         used_voxel_sizes = []
 
         for b in range(B):
-            pts = pts_all[b].reshape(-1, 3).float()   # (N_points, 3)
+            pts = pts_all[b].reshape(-1, 3).float()  # (N_points, 3)
             c = conf[b].reshape(-1).float() if conf is not None else None
-            # binary search to find the optimal voxel size
+
             curr_voxel_size = self._estimate_adaptive_voxel_size(pts, max_n)
             used_voxel_sizes.append(curr_voxel_size)
 
             vox_idx = (pts / curr_voxel_size).round().long()
             _, inv = torch.unique(vox_idx, dim=0, return_inverse=True)
+
             if c is not None:
                 c_pos = c.clamp(min=0)
                 vox_sum_c = scatter_add(c_pos, inv, dim=0)
@@ -284,6 +365,7 @@ class SceneQueryGSHead(nn.Module):
                 else:
                     top_idx = torch.randperm(vox_pts.shape[0], device=pts.device)[:max_n]
                 vox_pts = vox_pts[top_idx]
+
             results.append(vox_pts)
 
         valid_counts = torch.tensor(
@@ -291,32 +373,29 @@ class SceneQueryGSHead(nn.Module):
         )
         voxel_sizes = torch.tensor(
             used_voxel_sizes, device=pts_all.device, dtype=torch.float32
-        )  # (B,)
-        max_voxels = int(valid_counts.max().item())
-        # Pad with 0 (neutral value) instead of -1e4, valid_counts tracks real boundaries
-        anchor_pts = self.pad_tensor_list(results, (max_voxels,), value=0.0)
+        )
+        # Always pad to max_n (fixed shape for coarse/fine concatenation)
+        anchor_pts = self.pad_tensor_list(results, (max_n,), value=0.0)
         return anchor_pts, valid_counts, voxel_sizes
-        
+
     def _estimate_adaptive_voxel_size(self, pts: torch.Tensor, max_n: int, iterations: int = 10) -> float:
         """
-        Binary search to find the optimal voxel size that results in max_n anchors.
+        Binary search for the voxel size that yields approximately max_n anchors.
         """
-        # Use 5th/95th percentile to exclude outlier points (sky, far background)
-        # that would otherwise inflate diag and degrade binary search convergence
-        pt_min = torch.quantile(pts, 0.05, dim=0)
-        pt_max = torch.quantile(pts, 0.95, dim=0)
+        pt_min = torch.quantile(pts, 0.01, dim=0)
+        pt_max = torch.quantile(pts, 0.99, dim=0)
         diag = torch.norm(pt_max - pt_min).item()
-        
-        low = 0.0001
+
+        low = 0.00001
         high = diag
         best_size = high
-        
-        target_high = int(max_n * 1.1) 
+
+        target_high = int(max_n * 1.1)
         for _ in range(iterations):
             mid = (low + high) / 2
             v_idx = (pts / mid).round().long()
             num_voxels = torch.unique(v_idx, dim=0).shape[0]
-            
+
             if num_voxels > target_high:
                 low = mid
                 best_size = mid
@@ -324,7 +403,7 @@ class SceneQueryGSHead(nn.Module):
                 high = mid
             else:
                 return mid
-                
+
         return best_size
 
     def pad_tensor_list(
@@ -365,14 +444,13 @@ class SceneQueryGSHead(nn.Module):
 
         # Homogeneous world coords (B, N, 4)
         ones = torch.ones(B, N, 1, device=device, dtype=anchor_pts.dtype)
-        pts_h = torch.cat([anchor_pts, ones], dim=-1)  # (B, N, 4)
+        pts_h = torch.cat([anchor_pts, ones], dim=-1)
 
-        # World → camera:  (B, V, N, 3)
-        # extrinsic: (B, V, 3, 4)
-        P_cam = torch.einsum("bvij,bnj->bvni", extrinsic.float(), pts_h)  # (B, V, N, 3)
+        # World → camera: (B, V, N, 3)
+        P_cam = torch.einsum("bvij,bnj->bvni", extrinsic.float(), pts_h)
 
         # Project to pixel coords: (B, V, N, 3)
-        P_proj = torch.einsum("bvij,bvnj->bvni", intrinsic.float(), P_cam)  # (B, V, N, 3)
+        P_proj = torch.einsum("bvij,bvnj->bvni", intrinsic.float(), P_cam)
         depth_cam = P_cam[..., 2]  # (B, V, N)
 
         uv_pixel = P_proj[..., :2] / (P_proj[..., 2:3] + 1e-8)  # (B, V, N, 2)
@@ -381,7 +459,7 @@ class SceneQueryGSHead(nn.Module):
         hw_tensor = torch.tensor([W, H], dtype=uv_pixel.dtype, device=device)
         uv_norm = uv_pixel / hw_tensor  # (B, V, N, 2)
 
-        # Visibility: depth > 0 and uv in [0, 1]
+        # Visibility: depth > 0 and uv in (0, 1)
         vis_mask = (
             (depth_cam > 0)
             & (uv_norm[..., 0] > 0) & (uv_norm[..., 0] < 1)
@@ -392,8 +470,8 @@ class SceneQueryGSHead(nn.Module):
         uv_grid = uv_norm * 2 - 1  # (B, V, N, 2)
 
         # Flatten B*V for grid_sample
-        feat_flat = feat_2d.flatten(0, 1)                        # (B*V, C, H, W)
-        grid = uv_grid.flatten(0, 1).unsqueeze(2)                # (B*V, N, 1, 2)
+        feat_flat = feat_2d.flatten(0, 1)              # (B*V, C, H, W)
+        grid = uv_grid.flatten(0, 1).unsqueeze(2)      # (B*V, N, 1, 2)
         sampled_flat = F.grid_sample(
             feat_flat.float(), grid.float(),
             align_corners=True, padding_mode="zeros", mode="bilinear"
@@ -402,6 +480,6 @@ class SceneQueryGSHead(nn.Module):
         sampled = sampled_flat.view(B, V, N, C).permute(0, 2, 1, 3)  # (B, N, V, C)
 
         # Zero out invisible anchors
-        sampled = sampled * vis_mask.permute(0, 2, 1).unsqueeze(-1).float()  # (B, N, V, C)
+        sampled = sampled * vis_mask.permute(0, 2, 1).unsqueeze(-1).float()
 
         return sampled, vis_mask.permute(0, 2, 1)  # (B, N, V, C), (B, N, V)
