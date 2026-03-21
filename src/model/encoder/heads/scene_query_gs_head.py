@@ -114,6 +114,16 @@ class SceneQueryGSHead(nn.Module):
         # K learnable slot tokens to diversify K Gaussian decodings
         self.slot_tokens = nn.Parameter(torch.randn(n_offsets, latent_dim))
 
+        # Per-slot learnable UV offsets: each slot k samples 2D features from a
+        # different location around the anchor's projection (window-based sampling).
+        # Initialized on a unit circle so all K slots start at distinct directions.
+        angles = torch.linspace(0, 2 * math.pi * (n_offsets - 1) / n_offsets, n_offsets)
+        self.slot_uv_offsets = nn.Parameter(
+            torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)  # (K, 2)
+        )
+        # Project raw 2D features (feat_dim) to latent_dim for additive injection
+        self.slot_feat_proj = nn.Linear(feat_dim, latent_dim)
+
         self.apply(_init_weights)
 
     # ------------------------------------------------------------------
@@ -218,9 +228,26 @@ class SceneQueryGSHead(nn.Module):
         # 10. Slot tokens → K offsets and K GS params per anchor
         K = self.n_offsets
         N = self.num_anchors
+
+        # Window-based per-slot 2D feature sampling:
+        # each slot k samples features from a slightly different UV location around
+        # the anchor projection, giving each slot unique visual context.
+        coarse_slot_2d = self._sample_slot_features(
+            coarse_pts, feat_2d, extrinsic, intrinsic, H, W
+        )  # (B, num_coarse, K, latent_dim)
+        fine_slot_2d = self._sample_slot_features(
+            fine_pts, feat_2d, extrinsic, intrinsic, H, W
+        )  # (B, num_fine, K, latent_dim)
+        all_slot_2d = torch.cat([coarse_slot_2d, fine_slot_2d], dim=1)  # (B, N, K, latent_dim)
+
+        # Zero out padded (invalid) anchors so their spurious 2D samples don't contribute
+        all_valid_mask = torch.cat([coarse_mask, fine_mask], dim=1)  # (B, N)
+        all_slot_2d = all_slot_2d * all_valid_mask.unsqueeze(-1).unsqueeze(-1).float()
+
         query_exp = query_latent.unsqueeze(2).expand(-1, -1, K, -1)     # (B, N, K, latent_dim)
         slot_exp = self.slot_tokens[None, None].expand(B, N, -1, -1)    # (B, N, K, latent_dim)
-        slot_feat = torch.cat([query_exp, slot_exp], dim=-1)            # (B, N, K, latent_dim*2)
+        # Inject per-slot 2D context additively into slot tokens
+        slot_feat = torch.cat([query_exp, slot_exp + all_slot_2d], dim=-1)  # (B, N, K, latent_dim*2)
 
         # Per-anchor offset scale: coarse anchors use coarse voxel size, fine use fine
         anchor_voxel_sizes = torch.cat([
@@ -241,7 +268,7 @@ class SceneQueryGSHead(nn.Module):
         gs_positions_flat = gs_positions.reshape(B, N * K, 3)
 
         # 13. Mask padded anchors (opacity → -20 ≈ 0) and scale Gaussian scales by scene_scale
-        all_valid_mask = torch.cat([coarse_mask, fine_mask], dim=1)      # (B, N)
+        # (all_valid_mask already computed in step 10)
         valid_mask_flat = all_valid_mask.unsqueeze(2).expand(-1, -1, K).reshape(B, -1)
         gs_params_flat = gs_params_flat.clone()
         gs_params_flat[..., 0][~valid_mask_flat] = -20.0
@@ -483,3 +510,75 @@ class SceneQueryGSHead(nn.Module):
         sampled = sampled * vis_mask.permute(0, 2, 1).unsqueeze(-1).float()
 
         return sampled, vis_mask.permute(0, 2, 1)  # (B, N, V, C), (B, N, V)
+
+    def _sample_slot_features(
+        self,
+        anchor_pts: torch.Tensor,   # (B, N, 3)  world coords (zero-padded for invalid)
+        feat_2d: torch.Tensor,      # (B, V, C, H, W)
+        extrinsic: torch.Tensor,    # (B, V, 3, 4)
+        intrinsic: torch.Tensor,    # (B, V, 3, 3)
+        H: int,
+        W: int,
+    ) -> torch.Tensor:              # (B, N, K, latent_dim)
+        """
+        Window-based per-slot 2D feature sampling.
+
+        For each slot k, samples 2D features from a slightly different UV location
+        (offset by slot_uv_offsets[k], scaled to ~4px window) around each anchor's
+        projection.  Features are aggregated across visible views with a masked mean,
+        then projected to latent_dim for additive injection into slot tokens.
+
+        This gives each of the K slots unique visual context, mitigating the risk that
+        all K decoded Gaussians collapse to the same appearance.
+        """
+        B, N, _ = anchor_pts.shape
+        V = feat_2d.shape[1]
+        C = feat_2d.shape[2]
+        K = self.n_offsets
+        device = anchor_pts.device
+
+        # Project anchor_pts to each view → base UV coords in [-1, 1]
+        ones = torch.ones(B, N, 1, device=device, dtype=anchor_pts.dtype)
+        pts_h = torch.cat([anchor_pts, ones], dim=-1)                          # (B, N, 4)
+        P_cam = torch.einsum("bvij,bnj->bvni", extrinsic.float(), pts_h)       # (B, V, N, 3)
+        P_proj = torch.einsum("bvij,bvnj->bvni", intrinsic.float(), P_cam)     # (B, V, N, 3)
+        depth_cam = P_cam[..., 2]                                               # (B, V, N)
+        uv_pixel = P_proj[..., :2] / (P_proj[..., 2:3] + 1e-8)
+        hw_tensor = torch.tensor([W, H], dtype=uv_pixel.dtype, device=device)
+        uv_norm = uv_pixel / hw_tensor                                          # (B, V, N, 2) in [0,1]
+        base_uv = uv_norm * 2 - 1                                               # (B, V, N, 2) in [-1,1]
+
+        # Visibility: depth > 0 and projection inside image bounds
+        vis_mask = (
+            (depth_cam > 0)
+            & (uv_norm[..., 0] > 0) & (uv_norm[..., 0] < 1)
+            & (uv_norm[..., 1] > 0) & (uv_norm[..., 1] < 1)
+        )  # (B, V, N) — same mask for all slots (all offsets near anchor projection)
+
+        vis_float = vis_mask.permute(0, 2, 1).float()                           # (B, N, V)
+        vis_count = vis_float.sum(dim=2, keepdim=True).clamp(min=1)            # (B, N, 1)
+
+        # Per-slot UV offsets: tanh → [-1,1], scaled to ~8px window in [-1,1] grid space
+        window_scale = 8.0 / max(H, W)
+        offsets = torch.tanh(self.slot_uv_offsets) * window_scale              # (K, 2)
+
+        feat_flat = feat_2d.flatten(0, 1)  # (B*V, C, H, W)
+
+        slot_feats = []
+        for k in range(K):
+            uv_k = base_uv + offsets[k].view(1, 1, 1, 2)                       # (B, V, N, 2)
+            grid_k = uv_k.flatten(0, 1).unsqueeze(2)                           # (B*V, N, 1, 2)
+            sampled_k = F.grid_sample(
+                feat_flat.float(), grid_k.float(),
+                align_corners=True, padding_mode="zeros", mode="bilinear"
+            )  # (B*V, C, N, 1)
+            sampled_k = sampled_k.squeeze(-1).permute(0, 2, 1)                 # (B*V, N, C)
+            sampled_k = sampled_k.view(B, V, N, C).permute(0, 2, 1, 3)        # (B, N, V, C)
+            sampled_k = sampled_k * vis_float.unsqueeze(-1)                    # zero invisible
+
+            # Masked mean across views
+            agg_k = sampled_k.sum(dim=2) / vis_count                           # (B, N, C)
+            agg_k = self.slot_feat_proj(agg_k)                                 # (B, N, latent_dim)
+            slot_feats.append(agg_k)
+
+        return torch.stack(slot_feats, dim=2)  # (B, N, K, latent_dim)
