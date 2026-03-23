@@ -467,6 +467,38 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
 
         if self.cfg.use_scene_query:
             # ── Scene Query path ──
+            # Enhance fine-anchor conf signal:
+            #   depth_conf alone reflects depth certainty, which correlates poorly with
+            #   "where detail is needed". We augment it with image gradient magnitude so
+            #   fine anchors concentrate on texture/edge regions within the foreground.
+            #   depth_conf still acts as a foreground mask (sky/bg has genuinely low conf).
+            imgs_gray = (
+                0.299 * image[:, :, 0] +
+                0.587 * image[:, :, 1] +
+                0.114 * image[:, :, 2]
+            )  # (B, V, H, W)
+            sobel_kx = torch.tensor(
+                [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                dtype=torch.float32, device=device,
+            ).view(1, 1, 3, 3)
+            sobel_ky = torch.tensor(
+                [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                dtype=torch.float32, device=device,
+            ).view(1, 1, 3, 3)
+            gray_flat = imgs_gray.flatten(0, 1).unsqueeze(1).float()  # (B*V, 1, H, W)
+            grad_mag = (
+                F.conv2d(gray_flat, sobel_kx, padding=1) ** 2 +
+                F.conv2d(gray_flat, sobel_ky, padding=1) ** 2
+            ).sqrt().squeeze(1).view(b, v, h, w)  # (B, V, H, W)
+            # Per-sample normalisation → [0, 1]
+            grad_min = grad_mag.flatten(1).min(dim=1).values.view(b, 1, 1, 1)
+            grad_max = grad_mag.flatten(1).max(dim=1).values.view(b, 1, 1, 1)
+            grad_norm = (grad_mag - grad_min) / (grad_max - grad_min + 1e-8)
+            # λ=2.0: high-texture/edge regions get up to 3× the base conf weight,
+            # while flat foreground regions remain at 1× — empirically a good balance
+            # between uniform coverage and detail focus.
+            pts_conf_enhanced = pts_conf * (1.0 + 2.0 * grad_norm)
+
             gs_params, anchor_pts, query_latent = self.scene_query_head(
                 aggregated_tokens_list,
                 pts_all,
@@ -474,7 +506,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 extrinsic,
                 intrinsic,
                 patch_start_idx,
-                conf=pts_conf,
+                conf=pts_conf_enhanced,
             )
             # gs_params: (B, N*K, raw_gs_dim + 1), anchor_pts: (B, N*K, 3)  K = n_anchor_offset
             # anchor_pts: (B, N*K, 3) world-space Gaussian positions (anchor center + offset)
